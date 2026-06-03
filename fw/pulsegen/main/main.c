@@ -7,7 +7,7 @@
  * on the same hardware timer events).
  *
  *   Repetition rate : 160 MHz timer / 160 ticks = 1.000 MHz
- *   Pulse high-time : 1 tick = 6.25 ns  (smallest the peripheral can emit)
+ *   Pulse high-time : 32 ticks = 200 ns
  *
  *   OUT+  GPIO5  ---\
  *                    >--- differential pair to your receiver (terminate!)
@@ -28,7 +28,7 @@ static const char *TAG = "diff_pulse";
 
 #define TIMER_RES_HZ   160000000    /* 160 MHz: max MCPWM clock on S3 -> 6.25 ns/tick */
 #define PERIOD_TICKS   160          /* 160 MHz / 160 = 1.000 MHz repetition rate      */
-#define PULSE_TICKS    1            /* high-time in ticks; 1 = 6.25 ns (smallest)     */
+#define PULSE_TICKS    32           /* high-time in ticks; 32 x 6.25 ns = 200 ns       */
 /* ------------------------------------------------------------------------ */
 
 void app_main(void)
@@ -81,7 +81,7 @@ void app_main(void)
         MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
                                        cmp, MCPWM_GEN_ACTION_HIGH)));
 
-    /* 5. Strongest pad drive for the sharpest edges on a 6.25 ns pulse */
+    /* 5. Strongest pad drive for the sharpest edges */
     gpio_set_drive_capability(GEN_A_GPIO, GPIO_DRIVE_CAP_3);
     gpio_set_drive_capability(GEN_B_GPIO, GPIO_DRIVE_CAP_3);
 

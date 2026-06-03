@@ -5,7 +5,7 @@
  * Arduino-ESP32 3.x ships ESP-IDF v5.x underneath, so the same modern
  * MCPWM driver is available. Select board "Heltec WiFi LoRa 32(V3)".
  *
- *   OUT+ = GPIO5,  OUT- = GPIO6,  1 MHz,  6.25 ns high-time.
+ *   OUT+ = GPIO5,  OUT- = GPIO6,  1 MHz,  200 ns high-time.
  */
 
 #include "driver/mcpwm_prelude.h"
@@ -15,7 +15,7 @@
 #define GEN_B_GPIO     6
 #define TIMER_RES_HZ   160000000   // 6.25 ns / tick
 #define PERIOD_TICKS   160         // -> 1.000 MHz
-#define PULSE_TICKS    1           // -> 6.25 ns high-time (smallest)
+#define PULSE_TICKS    32          // -> 32 x 6.25 ns = 200 ns high-time
 
 void setup() {
   mcpwm_timer_handle_t timer = NULL;

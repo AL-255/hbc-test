@@ -8,11 +8,12 @@ peripheral.
 
 | Signal | Pin    | Description                         |
 |--------|--------|-------------------------------------|
-| OUT+   | GPIO5  | true pulse, HIGH for 6.25 ns        |
+| OUT+   | GPIO5  | true pulse, HIGH for 200 ns         |
 | OUT-   | GPIO6  | exact inverse of OUT+               |
 
 * **Repetition rate:** 1.000 MHz (1 µs period)
-* **Pulse high-time:** 6.25 ns (1 MCPWM tick @ 160 MHz) — the smallest the
+* **Pulse high-time:** 200 ns (32 MCPWM ticks @ 160 MHz, 6.25 ns/tick).
+  Resolution is 6.25 ns; set `PULSE_TICKS = 1` for the narrowest pulse the
   peripheral can emit.
 
 A single MCPWM timer drives both generators, so the two outputs are true
@@ -26,10 +27,9 @@ route a matched, length-controlled differential pair. `GPIO6`/`GPIO7` is an
 equally good alternate. Change `GEN_A_GPIO` / `GEN_B_GPIO` in the source to move
 them.
 
-> At a 6.25 ns width the GPIO's own slew rate dominates and the pulse may not
-> reach the full rail. If your receiver needs more amplitude, raise
-> `PULSE_TICKS` to 2 or 3 (12.5 / 18.75 ns). Keep both traces short, equal
-> length, and **terminate the pair at the receiver**.
+> Pulse width is `PULSE_TICKS x 6.25 ns`. Below ~5 ticks the GPIO's own slew
+> rate dominates and the pulse may not reach the full rail. Keep both traces
+> short, equal length, and **terminate the pair at the receiver**.
 
 ## Build & flash (ESP-IDF v5.x)
 
