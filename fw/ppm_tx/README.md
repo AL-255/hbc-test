@@ -66,7 +66,8 @@ from one internal signal, so there is no inter-channel skew.
 | `BASE_TICKS`     | minimum interval (32 = 400 ns)       |
 | `N_VALUES`       | payload length / sweep size          |
 | `OUT_A/B_GPIO`   | OUT+ / OUT- pins                     |
-| `INTER_BURST_MS` | gap between repeated demo bursts     |
+| `INTER_BURST_US` | gap between repeated demo bursts (us) |
 
-The demo repeats the burst every `INTER_BURST_MS` so it is easy to catch on a
-scope; for a true one-shot, call `rmt_transmit()` once instead of in the loop.
+The demo repeats the burst every `INTER_BURST_US` (100 us) so it is easy to
+catch on a scope; the gap is a busy-wait since it is below one FreeRTOS tick.
+For a true one-shot, call `rmt_transmit()` once instead of in the loop.

@@ -28,6 +28,7 @@
 #include "driver/rmt_encoder.h"
 #include "driver/gpio.h"
 #include "esp_rom_gpio.h"
+#include "esp_rom_sys.h"
 #include "soc/gpio_struct.h"
 #include "esp_log.h"
 
@@ -42,7 +43,7 @@ static const char *TAG = "ppm_tx";
 #define BASE_TICKS    32           /* 400 ns minimum interval (position 0)    */
 
 #define N_VALUES      128          /* payload sweep 0..127                    */
-#define INTER_BURST_MS 10          /* gap between repeated demo bursts        */
+#define INTER_BURST_US 100         /* gap between repeated demo bursts (us)   */
 /* ------------------------------------------------------------------------ */
 
 static uint8_t          s_payload[N_VALUES];   /* the data buffer: 0..127 sweep   */
@@ -118,9 +119,12 @@ void app_main(void)
     while (1) {
         ESP_ERROR_CHECK(rmt_transmit(chan, encoder, s_frame, sizeof(s_frame), &tx_cfg));
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(chan, portMAX_DELAY));
-        if (++bursts % 100 == 0) {
+        if (++bursts % 1000 == 0) {
             ESP_LOGI(TAG, "%u bursts sent", (unsigned)bursts);
         }
-        vTaskDelay(pdMS_TO_TICKS(INTER_BURST_MS));
+        /* sub-tick gap, so busy-wait instead of vTaskDelay(). The
+         * wait_all_done() above blocks on a semaphore each loop, so the idle
+         * task still runs and the task watchdog stays fed. */
+        esp_rom_delay_us(INTER_BURST_US);
     }
 }
