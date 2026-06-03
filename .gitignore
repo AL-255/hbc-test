@@ -1,0 +1,20 @@
+# ESP-IDF build output
+build/
+**/build/
+
+# Active sdkconfig is generated from sdkconfig.defaults + `idf.py set-target`.
+# (sdkconfig.defaults IS tracked; the resolved config is reproducible.)
+sdkconfig
+sdkconfig.old
+
+# IDF component manager
+managed_components/
+dependencies.lock
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+__pycache__/
+*.pyc
