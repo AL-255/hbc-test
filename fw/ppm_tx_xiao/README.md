@@ -1,37 +1,35 @@
 # XIAO ESP32-S3 PPM transmitter
 
 Port of `../ppm_tx` for the **Seeed Studio XIAO ESP32-S3**, with an independent
-configurable PWM output. Two synchronized RMT channels generate PPM phases
-with a both-LOW dead-time gap at each handoff.
+configurable PWM output. Two synchronized RMT channels generate same-polarity PPM pulses,
+with the narrower pulse centered inside the wider pulse.
 
 ## Outputs
 
 | Signal | XIAO pin | ESP32-S3 GPIO | Behavior |
 |--------|----------|---------------|----------|
 | PWM | D0 | GPIO1 | 100% duty: constant HIGH (nominal 3.3 V) |
-| PPM OUT+ | D4 | GPIO5 | RMT TX, idle low |
-| PPM OUT- | D3 | GPIO4 | Complementary phase with dead time, idle low |
+| PPM A | D4 | GPIO5 | Outer 200 ns pulse, idle low |
+| PPM B | D3 | GPIO4 | Same polarity, centered 150 ns pulse, idle low |
 
 The board labels determine the pin mapping: D3/D4 are GPIO4/5, as listed in
 the [Seeed pinout](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/).
 GPIO5/6 would instead be D4/D5.
 
-* OUT+ pulse width: **200 ns** (`PULSE_TICKS = 16` at 80 MHz), unchanged.
-* OUT- HIGH width: **200–987.5 ns**, preserving the original complementary
-  phase widths for the 128-value sweep.
-* Dead time at **each** handoff: **10% of the configured OUT+ pulse width**,
-  rounded up to the next 12.5 ns RMT tick. At 200 ns, the requested 20 ns
-  becomes **25 ns** (`DEAD_TICKS = 2`). Both outputs are LOW during this gap.
-* OUT+ rising-edge interval:
-  `400 ns + (value >> 1) * 12.5 ns + 2 * dead_time`, from **450 ns to
-  1237.5 ns** with the defaults. Adding gaps without shortening either phase
-  extends the original interval by 50 ns; it no longer fits the old
-  400–1200 ns window.
-* The 128-value sweep is pre-rendered. OUT+ uses the S3's single DMA TX
-  channel; OUT- uses three hardware memory blocks (144 symbols), enough for
+* PPM A pulse width: **200 ns** (`PULSE_TICKS = 16` at 80 MHz), unchanged.
+* PPM B has the **same polarity**, with its HIGH pulse centered inside A:
+  `PULSE_TICKS - 2 * DEAD_TICKS`, or **150 ns** with the defaults.
+* Dead time is an inset at **each edge** of A's pulse: **10% of the configured
+  pulse width**, rounded up to the next 12.5 ns tick. The requested 20 ns
+  becomes **25 ns** (`DEAD_TICKS = 2`). B rises 25 ns after A and falls 25 ns
+  before A. During these margins A is HIGH and B is LOW.
+* A rising-edge interval: `400 ns + (value >> 1) * 12.5 ns`, from **400 ns to
+  1187.5 ns**. The inset does not extend the interval.
+* The 128-value sweep is pre-rendered. A uses the S3's single DMA TX
+  channel; B uses three hardware memory blocks (144 symbols), enough for
   its 129-symbol frame plus EOF. No mid-frame refill interrupt is needed.
-* The RMT sync manager starts both channels together and is reset after each
-  completed burst. Both outputs remain LOW during the 100 us inter-burst gap.
+* The RMT sync manager starts both channels together and is reset before each
+  burst. Both outputs remain LOW during the 100 us inter-burst gap.
 * D0 runs independently of PPM. `PWM_DUTY_PERCENT = 100` holds it HIGH;
   `0` holds it LOW. For `1..99`, LEDC generates continuous PWM at
   `PWM_FREQ_HZ` (currently 100 kHz), including between PPM bursts.
@@ -40,13 +38,13 @@ GPIO5/6 would instead be D4/D5.
 For each payload value, the sequence is:
 
 ```text
-OUT+ HIGH for PULSE_TICKS
-both LOW for DEAD_TICKS
-OUT- HIGH for BASE_TICKS + (value >> 1) - PULSE_TICKS
-both LOW for DEAD_TICKS
+A HIGH, B LOW for DEAD_TICKS
+both HIGH for PULSE_TICKS - 2 * DEAD_TICKS
+A HIGH, B LOW for DEAD_TICKS
+both LOW for BASE_TICKS + (value >> 1) - PULSE_TICKS
 ```
 
-Use a scope to check D0's frequency/duty and the complementary PPM waveform
+Use a scope to check D0's frequency/duty and the nested PPM pulses
 after flashing. Compilation alone does not verify physical output timing.
 
 ## Build on Windows
@@ -97,8 +95,9 @@ and `idf.py -p <port> flash monitor` from this directory.
 `main/main.c` defines `PWM_GPIO`, `PWM_FREQ_HZ`, `PWM_DUTY_PERCENT`, `OUT_A_GPIO`, `OUT_B_GPIO`,
 `PULSE_TICKS`, `DEAD_TIME_PERCENT`, `BASE_TICKS`, `N_VALUES`, and `INTER_BURST_US`.
 Dead time is computed from `PULSE_TICKS`; changing the pulse-width parameter
-automatically changes the gap. The frame size is limited to 128 values so
-the complete OUT- waveform fits in hardware RAM.
+automatically changes the inset. The inset on both edges must leave a positive
+B pulse (`2 * DEAD_TICKS < PULSE_TICKS`). The frame size is limited to 128 values so
+the complete B waveform fits in hardware RAM.
 PWM frequency and duty are separate parameters. For example, set
 `PWM_FREQ_HZ = 100000` and `PWM_DUTY_PERCENT = 50` for 100 kHz at 50% duty.
 At 0% or 100%, GPIO drives a constant level and frequency is unused.

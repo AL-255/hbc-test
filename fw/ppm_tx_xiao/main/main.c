@@ -2,21 +2,22 @@
  * PPM (Pulse-Position Modulation) transmitter
  * Board : Seeed Studio XIAO ESP32-S3
  *
- * Two synchronized RMT channels generate non-overlapping phases. The complete
+ * Two synchronized RMT channels generate same-polarity, nested pulses. The complete
  * frame is pre-rendered: OUT+ streams by DMA; OUT- fits in hardware RMT RAM.
  * Neither channel needs CPU service to generate individual pulses.
  *
  * Timing (RMT runs at 80 MHz, the S3 maximum -> 12.5 ns / tick):
  *   Pulse width : 200 ns  = 16 ticks  (constant)
- *   Dead time   : ceil(pulse width * 10%) on the 12.5 ns grid = 25 ns
- *   Interval    : 400 ns + position * 12.5 ns + 2 * dead time
+ *   Dead time   : ceil(pulse width * 10%) on the 12.5 ns grid = 25 ns per edge
+ *   Inner pulse : 200 ns - 2 * dead time = 150 ns, centered in the outer pulse
+ *   Interval    : 400 ns + position * 12.5 ns
  *   Payload     : value 0..127, position = value >> 1  (2:1 -> 64 positions)
- *                 -> interval 450 ns .. 1237.5 ns with the default dead time
+ *                 -> interval 400 ns .. 1187.5 ns
  *
- * Both PPM outputs are LOW during dead time and between bursts:
+ * Both PPM outputs idle LOW between pulses and between bursts:
  *   PWM   D0 / GPIO1: configurable frequency/duty; 100% holds HIGH
- *   OUT+  D4 / GPIO5
- *   OUT-  D3 / GPIO4
+ *   PPM A D4 / GPIO5: outer pulse
+ *   PPM B D3 / GPIO4: same polarity, inset by dead time on each edge
  */
 
 #include <stdint.h>
@@ -35,8 +36,8 @@ static const char *TAG = "ppm_tx_xiao";
 #define PWM_GPIO      1            /* D0: independent PWM output             */
 #define PWM_FREQ_HZ   100000       /* frequency used when duty is 1..99%      */
 #define PWM_DUTY_PERCENT 100       /* 0 = LOW, 100 = HIGH, otherwise PWM      */
-#define OUT_A_GPIO    5            /* D4: OUT+ (RMT TX pad)                   */
-#define OUT_B_GPIO    4            /* D3: OUT- (separate synchronized phase)  */
+#define OUT_A_GPIO    5            /* D4: outer PPM pulse                     */
+#define OUT_B_GPIO    4            /* D3: same polarity, narrower by 2 x DT   */
 
 #define RMT_RES_HZ    80000000     /* 80 MHz -> 12.5 ns / tick (RMT max on S3)*/
 #define PULSE_TICKS   16           /* 200 ns constant high time (16 x 12.5 ns)*/
@@ -53,40 +54,49 @@ _Static_assert(PWM_FREQ_HZ > 0, "PWM frequency must be positive");
 _Static_assert(PWM_DUTY_PERCENT >= 0 && PWM_DUTY_PERCENT <= 100,
                "PWM duty must be between 0 and 100 percent");
 _Static_assert(PULSE_TICKS > 0 && PULSE_TICKS < BASE_TICKS,
-               "Both phase widths must be positive");
+               "Outer pulse and inter-pulse gap must be positive");
 _Static_assert(DEAD_TICKS > 0, "Dead time must be at least one RMT tick");
+_Static_assert(2 * DEAD_TICKS < PULSE_TICKS,
+               "Dead-time margins must leave a positive inner pulse");
 _Static_assert(N_VALUES > 0 && N_VALUES <= 128, "Payload is a 7-bit sweep");
 _Static_assert(N_VALUES + 2 <= PHASE_B_MEM_SYMBOLS,
                "OUT- frame plus EOF must fit completely in hardware RAM");
-_Static_assert(BASE_TICKS + ((N_VALUES - 1) >> 1) + 2 * DEAD_TICKS <= 32767,
+_Static_assert(BASE_TICKS + ((N_VALUES - 1) >> 1) <= 32767,
                "RMT durations must fit the 15-bit field");
 
 static rmt_symbol_word_t s_frame_a[N_VALUES];
 static rmt_symbol_word_t s_frame_b[N_VALUES + 1];
 
 /*
- * Preserve both original HIGH widths, inserting a both-LOW gap between them:
- *   OUT+ HIGH P, both LOW D, OUT- HIGH L, both LOW D.
- *   P = PULSE_TICKS; L = BASE_TICKS + (value >> 1) - P; D = DEAD_TICKS.
- * The OUT- LOW run spans the previous trailing gap, OUT+'s pulse, and the
- * next gap. The first run has no previous trailing gap; the last is explicit.
+ * Back-port ppm_tx's nested, same-polarity waveform. A's width and rising-edge
+ * interval are unchanged; B rises D ticks later and falls D ticks earlier.
+ * B's leading LOW run uses the PREVIOUS interval so changing payload values
+ * cannot move its pulse away from the center of the corresponding A pulse.
+ * Append a LOW tail to keep both frame lengths equal and both outputs idle LOW.
  */
+static inline uint32_t interval_ticks(uint8_t value)
+{
+    return BASE_TICKS + (value >> 1);
+}
+
 static void render_frames(void)
 {
     for (int i = 0; i < N_VALUES; i++) {
-        uint32_t phase_b_ticks = BASE_TICKS + (i >> 1) - PULSE_TICKS;
+        uint32_t interval = interval_ticks(i);
+        uint32_t gap = (i == 0) ? DEAD_TICKS
+            : interval_ticks(i - 1) - PULSE_TICKS + 2 * DEAD_TICKS;
         s_frame_a[i] = (rmt_symbol_word_t) {
             .level0 = 1, .duration0 = PULSE_TICKS,
-            .level1 = 0, .duration1 = phase_b_ticks + 2 * DEAD_TICKS,
+            .level1 = 0, .duration1 = interval - PULSE_TICKS,
         };
         s_frame_b[i] = (rmt_symbol_word_t) {
-            .level0 = 0, .duration0 = PULSE_TICKS + (i == 0 ? DEAD_TICKS : 2 * DEAD_TICKS),
-            .level1 = 1, .duration1 = phase_b_ticks,
+            .level0 = 0, .duration0 = gap,
+            .level1 = 1, .duration1 = PULSE_TICKS - 2 * DEAD_TICKS,
         };
     }
     s_frame_b[N_VALUES] = (rmt_symbol_word_t) {
-        .level0 = 0, .duration0 = DEAD_TICKS,
-        .level1 = 0, .duration1 = 0, /* stop after the final both-LOW gap */
+        .level0 = 0, .duration0 = interval_ticks(N_VALUES - 1) - PULSE_TICKS + DEAD_TICKS,
+        .level1 = 0, .duration1 = 0, /* stop after the final inter-pulse gap */
     };
 }
 
@@ -188,9 +198,10 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(rmt_new_sync_manager(&sync_cfg, &sync));
 
-    ESP_LOGI(TAG, "PPM TX ready: OUT+=GPIO%d OUT-=GPIO%d | pulse %.1f ns | "
-                  "dead time %d%% requested, %.1f ns actual at each handoff | %d-value sweep",
+    ESP_LOGI(TAG, "PPM TX ready: A=GPIO%d B=GPIO%d (same polarity) | outer %.1f ns, inner %.1f ns | "
+                  "dead time %d%% requested, %.1f ns inset per edge | %d-value sweep",
              OUT_A_GPIO, OUT_B_GPIO, PULSE_TICKS * 1e9 / RMT_RES_HZ,
+             (PULSE_TICKS - 2 * DEAD_TICKS) * 1e9 / RMT_RES_HZ,
              DEAD_TIME_PERCENT, DEAD_TICKS * 1e9 / RMT_RES_HZ, N_VALUES);
 
     /* 5. Fire the sweep as one finite DMA burst; repeat with a gap so a scope
@@ -202,11 +213,11 @@ void app_main(void)
 
     uint32_t bursts = 0;
     while (1) {
+        ESP_ERROR_CHECK(rmt_sync_reset(sync));
         ESP_ERROR_CHECK(rmt_transmit(channels[0], encoders[0], s_frame_a, sizeof(s_frame_a), &tx_cfg));
         ESP_ERROR_CHECK(rmt_transmit(channels[1], encoders[1], s_frame_b, sizeof(s_frame_b), &tx_cfg));
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(channels[0], -1));
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(channels[1], -1));
-        ESP_ERROR_CHECK(rmt_sync_reset(sync));
         if (++bursts % 1000 == 0) {
             ESP_LOGI(TAG, "%u bursts sent", (unsigned)bursts);
         }
