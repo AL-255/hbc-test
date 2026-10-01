@@ -16,9 +16,9 @@
  *
  * Outputs (complementary / differential, zero skew -- both derive from the
  * same RMT signal; OUT- is the same signal inverted at the pad):
- *   PWM   D0 / GPIO1: 1 MHz, 50% duty, independent LEDC output
- *   OUT+  D3 / GPIO4
- *   OUT-  D4 / GPIO5
+ *   PWM   D0 / GPIO1: 100 kHz, 50% duty, independent LEDC output
+ *   OUT+  D4 / GPIO5
+ *   OUT-  D3 / GPIO4
  */
 
 #include <stdint.h>
@@ -38,9 +38,9 @@ static const char *TAG = "ppm_tx_xiao";
 
 /* ---- User configuration ------------------------------------------------ */
 #define PWM_GPIO      1            /* D0: independent PWM output             */
-#define PWM_FREQ_HZ   1000000      /* 1 MHz, 50% duty                        */
-#define OUT_A_GPIO    4            /* D3: OUT+ (RMT TX pad)                   */
-#define OUT_B_GPIO    5            /* D4: OUT- (inverted mirror of OUT+)      */
+#define PWM_FREQ_HZ   100000       /* 100 kHz, 50% duty                      */
+#define OUT_A_GPIO    5            /* D4: OUT+ (RMT TX pad)                   */
+#define OUT_B_GPIO    4            /* D3: OUT- (inverted mirror of OUT+)      */
 
 #define RMT_RES_HZ    80000000     /* 80 MHz -> 12.5 ns / tick (RMT max on S3)*/
 #define PULSE_TICKS   16           /* 200 ns constant high time (16 x 12.5 ns)*/

@@ -7,9 +7,9 @@ continuous PWM output. PPM keeps the original pre-rendered RMT DMA waveform.
 
 | Signal | XIAO pin | ESP32-S3 GPIO | Behavior |
 |--------|----------|---------------|----------|
-| PWM | D0 | GPIO1 | 1 MHz, 50% duty (500 ns high / 500 ns low), LEDC |
-| PPM OUT+ | D3 | GPIO4 | RMT TX, idle low |
-| PPM OUT- | D4 | GPIO5 | Inverted mirror of the same RMT signal, idle high |
+| PWM | D0 | GPIO1 | 100 kHz, 50% duty (5 us high / 5 us low), LEDC |
+| PPM OUT+ | D4 | GPIO5 | RMT TX, idle low |
+| PPM OUT- | D3 | GPIO4 | Inverted mirror of the same RMT signal, idle high |
 
 The board labels determine the pin mapping: D3/D4 are GPIO4/5, as listed in
 the [Seeed pinout](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/).
