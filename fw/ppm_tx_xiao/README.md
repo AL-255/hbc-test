@@ -49,6 +49,19 @@ after flashing. Compilation alone does not verify physical output timing.
 
 ## Build on Windows
 
+For a one-step build and flash, connect the board and double-click
+`build_flash.bat` in this directory. It loads the installed ESP-IDF environment,
+builds the firmware, and flashes **COM8** by default. The window stays open so
+you can read the result. To use another port from a terminal:
+
+```bat
+build_flash.bat COM7
+```
+
+Use `build_flash.bat COM8 --no-pause` for terminal or unattended use. A failed
+build prevents flashing, and the script returns a nonzero exit code on failure.
+It runs from its own directory regardless of where you launch it.
+
 With the installed ESP-IDF toolchain at `C:\esp`:
 
 ```powershell
