@@ -35,7 +35,7 @@ static const char *TAG = "ppm_tx_xiao";
 /* ---- User configuration ------------------------------------------------ */
 #define PWM_GPIO      1            /* D0: independent PWM output             */
 #define PWM_FREQ_HZ   100000       /* frequency used when duty is 1..99%      */
-#define PWM_DUTY_PERCENT 100       /* 0 = LOW, 100 = HIGH, otherwise PWM      */
+#define PWM_DUTY_PERCENT 50        /* 0 = LOW, 100 = HIGH, otherwise PWM      */
 #define OUT_A_GPIO    5            /* D4: outer PPM pulse                     */
 #define OUT_B_GPIO    4            /* D3: same polarity, narrower by 2 x DT   */
 

@@ -8,7 +8,7 @@ with the narrower pulse centered inside the wider pulse.
 
 | Signal | XIAO pin | ESP32-S3 GPIO | Behavior |
 |--------|----------|---------------|----------|
-| PWM | D0 | GPIO1 | 100% duty: constant HIGH (nominal 3.3 V) |
+| PWM | D0 | GPIO1 | 100 kHz, 50% duty (5 us HIGH / 5 us LOW) |
 | PPM A | D4 | GPIO5 | Outer 200 ns pulse, idle low |
 | PPM B | D3 | GPIO4 | Same polarity, centered 150 ns pulse, idle low |
 
@@ -30,7 +30,8 @@ GPIO5/6 would instead be D4/D5.
   its 129-symbol frame plus EOF. No mid-frame refill interrupt is needed.
 * The RMT sync manager starts both channels together and is reset before each
   burst. Both outputs remain LOW during the 100 us inter-burst gap.
-* D0 runs independently of PPM. `PWM_DUTY_PERCENT = 100` holds it HIGH;
+* D0 runs independently of PPM, currently at **100 kHz, 50% duty**.
+  `PWM_DUTY_PERCENT = 100` holds it HIGH;
   `0` holds it LOW. For `1..99`, LEDC generates continuous PWM at
   `PWM_FREQ_HZ` (currently 100 kHz), including between PPM bursts.
   PWM phase is not synchronized to PPM.
