@@ -8,8 +8,8 @@ continuous PWM output. PPM keeps the original pre-rendered RMT DMA waveform.
 | Signal | XIAO pin | ESP32-S3 GPIO | Behavior |
 |--------|----------|---------------|----------|
 | PWM | D0 | GPIO1 | 1 MHz, 50% duty (500 ns high / 500 ns low), LEDC |
-| PPM OUT+ | D3 | GPIO4 | RMT TX, idle low |
-| PPM OUT- | D4 | GPIO5 | Inverted mirror of the same RMT signal, idle high |
+| PPM OUT+ | D4 | GPIO5 | RMT TX, idle low |
+| PPM OUT- | D3 | GPIO4 | Inverted mirror of the same RMT signal, idle high |
 
 The board labels determine the pin mapping: D3/D4 are GPIO4/5, as listed in
 the [Seeed pinout](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/).
@@ -26,6 +26,19 @@ GPIO5/6 would instead be D4/D5.
 
 Use a scope to check D0's frequency/duty and the complementary PPM waveform
 after flashing. Compilation alone does not verify physical output timing.
+
+At startup, `PWM pad check` reports a hardware pulse-counter readback from
+GPIO1 after all output peripherals are configured. It counts both edges for
+about 1 ms; roughly 2000 edges indicates a 1 MHz waveform. The reported
+frequency is approximate because starting/stopping the measurement adds
+software overhead. An error is logged if the result differs by more than 5%.
+This checks transitions at the chip's pad, but does not measure duty cycle,
+voltage amplitude, or the connection between the pad and your probe.
+
+If D0 appears flat, probe D0 relative to a board GND with a high-impedance
+input (for example, a scope's 1 MOhm input and a 10x probe), and use a timebase
+around 200 ns/div. Check the pin label and header/solder contact. A meter
+does not display the 1 MHz waveform.
 
 ## Build on Windows
 

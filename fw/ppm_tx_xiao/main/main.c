@@ -17,8 +17,8 @@
  * Outputs (complementary / differential, zero skew -- both derive from the
  * same RMT signal; OUT- is the same signal inverted at the pad):
  *   PWM   D0 / GPIO1: 1 MHz, 50% duty, independent LEDC output
- *   OUT+  D3 / GPIO4
- *   OUT-  D4 / GPIO5
+ *   OUT+  D4 / GPIO5
+ *   OUT-  D3 / GPIO4
  */
 
 #include <stdint.h>
@@ -29,6 +29,8 @@
 #include "driver/rmt_encoder.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/pulse_cnt.h"
+#include "esp_timer.h"
 #include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
 #include "soc/gpio_struct.h"
@@ -39,8 +41,8 @@ static const char *TAG = "ppm_tx_xiao";
 /* ---- User configuration ------------------------------------------------ */
 #define PWM_GPIO      1            /* D0: independent PWM output             */
 #define PWM_FREQ_HZ   1000000      /* 1 MHz, 50% duty                        */
-#define OUT_A_GPIO    4            /* D3: OUT+ (RMT TX pad)                   */
-#define OUT_B_GPIO    5            /* D4: OUT- (inverted mirror of OUT+)      */
+#define OUT_A_GPIO    5            /* D4: OUT+ (RMT TX pad)                   */
+#define OUT_B_GPIO    4            /* D3: OUT- (inverted mirror of OUT+)      */
 
 #define RMT_RES_HZ    80000000     /* 80 MHz -> 12.5 ns / tick (RMT max on S3)*/
 #define PULSE_TICKS   16           /* 200 ns constant high time (16 x 12.5 ns)*/
@@ -93,8 +95,52 @@ static void pwm_init(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&channel_cfg));
     ESP_ERROR_CHECK(gpio_set_drive_capability(PWM_GPIO, GPIO_DRIVE_CAP_3));
-    ESP_LOGI(TAG, "PWM ready: D0/GPIO%d | %u Hz, 50%% duty",
+    ESP_LOGI(TAG, "PWM configured: D0/GPIO%d | %u Hz, 50%% duty",
              PWM_GPIO, (unsigned)PWM_FREQ_HZ);
+}
+
+/* Read back transitions at the GPIO pad after all outputs are configured.
+ * PCNT enables the pad's input path without replacing its LEDC output route.
+ * Count both edges for 1 ms; a 1 MHz PWM should produce about 2000 edges. */
+static void pwm_check_output(void)
+{
+    pcnt_unit_handle_t unit = NULL;
+    pcnt_channel_handle_t channel = NULL;
+    pcnt_unit_config_t unit_cfg = {
+        .clk_src = PCNT_CLK_SRC_DEFAULT,
+        .low_limit = -32768,
+        .high_limit = 32767,
+    };
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &unit));
+    pcnt_chan_config_t channel_cfg = {
+        .edge_gpio_num = PWM_GPIO,
+        .level_gpio_num = -1,
+    };
+    ESP_ERROR_CHECK(pcnt_new_channel(unit, &channel_cfg, &channel));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(channel,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(channel,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_KEEP));
+    ESP_ERROR_CHECK(pcnt_unit_enable(unit));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(unit));
+    int64_t start_us = esp_timer_get_time();
+    ESP_ERROR_CHECK(pcnt_unit_start(unit));
+    esp_rom_delay_us(1000);
+    ESP_ERROR_CHECK(pcnt_unit_stop(unit));
+    int64_t elapsed_us = esp_timer_get_time() - start_us;
+    int edges = 0;
+    ESP_ERROR_CHECK(pcnt_unit_get_count(unit, &edges));
+    uint32_t measured_hz = (uint32_t)((int64_t)edges * 1000000 / (2 * elapsed_us));
+    ESP_LOGI(TAG, "PWM pad check: D0/GPIO%d | %d edges in %u us | ~%u Hz",
+             PWM_GPIO, edges, (unsigned)elapsed_us, (unsigned)measured_hz);
+    if (measured_hz < PWM_FREQ_HZ * 95 / 100 ||
+        measured_hz > PWM_FREQ_HZ * 105 / 100) {
+        ESP_LOGE(TAG, "PWM pad check failed: expected %u Hz; check output routing and load",
+                 (unsigned)PWM_FREQ_HZ);
+    }
+    ESP_ERROR_CHECK(pcnt_unit_disable(unit));
+    ESP_ERROR_CHECK(pcnt_del_channel(channel));
+    ESP_ERROR_CHECK(pcnt_del_unit(unit));
 }
 
 void app_main(void)
@@ -136,6 +182,7 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_set_drive_capability(OUT_B_GPIO, GPIO_DRIVE_CAP_3));
 
     ESP_ERROR_CHECK(rmt_enable(chan));
+    pwm_check_output();
 
     ESP_LOGI(TAG, "PPM TX ready: OUT+=GPIO%d OUT-=GPIO%d | 200 ns pulse, "
                   "12.5 ns grid | %d-value sweep (%u symbols) per DMA burst",
