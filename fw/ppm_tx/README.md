@@ -50,6 +50,18 @@ from one internal signal, so there is no inter-channel skew.
 
 ## Build & flash
 
+On Windows, double-click `build_flash.bat` and enter the Heltec board's COM
+port, or run it from a terminal:
+
+```bat
+build_flash.bat COM7
+build_flash.bat --build-only --no-pause
+```
+
+The batch file loads `C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1`
+for ESP-IDF at `C:\esp`, selects ESP32-S3, and builds before flashing.
+It keeps the result visible unless the second argument is `--no-pause`.
+
 ```bash
 ./flash.sh -m          # build, auto-detect port, flash, open monitor
 ./flash.sh -b          # build only
