@@ -2,4 +2,5 @@
 # Target: ESP32-S3 (Seeed Studio XIAO ESP32-S3)
 cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+idf_build_set_property(MINIMAL_BUILD ON)
 project(ppm_tx_xiao)

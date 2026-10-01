@@ -29,7 +29,8 @@ GPIO5/6 would instead be D4/D5.
   channel; B uses three hardware memory blocks (144 symbols), enough for
   its 129-symbol frame plus EOF. No mid-frame refill interrupt is needed.
 * The RMT sync manager starts both channels together and is reset before each
-  burst. Both outputs remain LOW during the 100 us inter-burst gap.
+  burst. Both outputs remain LOW during the interrupt-timed inter-burst gap
+  (at least 100 us, plus interrupt/wakeup and next-burst setup latency).
 * D0 runs independently of PPM, currently at **100 kHz, 50% duty**.
   `PWM_DUTY_PERCENT = 100` holds it HIGH;
   `0` holds it LOW. For `1..99`, LEDC generates continuous PWM at
@@ -47,6 +48,40 @@ both LOW for BASE_TICKS + (value >> 1) - PULSE_TICKS
 
 Use a scope to check D0's frequency/duty and the nested PPM pulses
 after flashing. Compilation alone does not verify physical output timing.
+
+## Power consumption
+
+The transmitter task blocks throughout each hardware-generated frame and its
+inter-burst gap. RMT/GDMA completion interrupts start a one-shot GPTimer after
+both channels finish. The timer interrupt wakes the task after `INTER_BURST_US`.
+There is no polling, application busy-wait delay, or per-pulse CPU interrupt.
+A's complete frame and end marker fit in one DMA descriptor, avoiding a
+mid-frame descriptor interrupt; B's complete frame fits in RMT hardware memory.
+
+ESP-IDF's idle task executes the CPU's **WAITI** (wait for interrupt) instruction
+while the transmitter task is blocked. This is CPU idle sleep, not chip
+Light-sleep or Deep-sleep: those modes would stop the 80 MHz APB-driven
+RMT/DMA waveform. The APB/peripheral clocks stay running while the CPU waits.
+The CPU runs at a fixed **80 MHz**, with dynamic frequency scaling disabled,
+and only CPU0 is started. RMT explicitly uses the fixed **80 MHz APB** clock;
+D0 PWM and the gap timer use the **40 MHz crystal**. Pulse timing is generated
+by peripherals, without changing CPU frequency for each burst.
+
+The minimal build excludes Wi-Fi, Bluetooth/BLE, and their RF PHY driver;
+these radios are never initialized. The previous firmware also did not start
+the radios, so removing these drivers does not imply additional radio current
+savings. USB Serial/JTAG remains available for flashing and monitoring.
+
+Status logging is limited to one report every five seconds. Reports show idle
+task runtime share and idle-hook entries leading to WAITI. Idle task runtime
+includes some interrupt overhead; it is not an exact measurement of time spent
+in WAITI or of current consumption. Measure supply current and scope the outputs
+to verify the physical power reduction and pulse timing on your board.
+
+Power-related build settings are in `sdkconfig.defaults`. When upgrading an
+existing build on another machine, back up and regenerate its ignored
+`sdkconfig` so these defaults take effect. Compilation checks that CPU frequency
+is 80 MHz, single-core mode is selected, and dynamic power management is off.
 
 ## Build on Windows
 

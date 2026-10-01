@@ -27,8 +27,16 @@
 #include "driver/rmt_encoder.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
-#include "esp_rom_sys.h"
+#include "driver/gptimer.h"
+#include "esp_attr.h"
+#include "esp_clk_tree.h"
+#include "esp_freertos_hooks.h"
+#include "esp_timer.h"
 #include "esp_log.h"
+
+#if CONFIG_PM_ENABLE || CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ != 80 || !CONFIG_FREERTOS_UNICORE
+#error "Use the fixed 80 MHz, single-core settings in sdkconfig.defaults"
+#endif
 
 static const char *TAG = "ppm_tx_xiao";
 
@@ -44,10 +52,12 @@ static const char *TAG = "ppm_tx_xiao";
 #define BASE_TICKS    32           /* 400 ns minimum interval (position 0)    */
 #define DEAD_TIME_PERCENT 10       /* percentage of PULSE_TICKS, rounded UP   */
 #define DEAD_TICKS ((PULSE_TICKS * DEAD_TIME_PERCENT + 99) / 100)
+#define PHASE_A_DMA_SYMBOLS 288     /* frame + EOF fit in the first DMA half */
 #define PHASE_B_MEM_SYMBOLS 144     /* three 48-symbol blocks; DMA uses fourth */
 
 #define N_VALUES      128          /* payload sweep 0..127                    */
 #define INTER_BURST_US 100         /* gap between repeated demo bursts (us)   */
+#define STATUS_INTERVAL_US 5000000 /* infrequent logging reduces CPU/USB work */
 /* ------------------------------------------------------------------------ */
 
 _Static_assert(PWM_FREQ_HZ > 0, "PWM frequency must be positive");
@@ -59,13 +69,72 @@ _Static_assert(DEAD_TICKS > 0, "Dead time must be at least one RMT tick");
 _Static_assert(2 * DEAD_TICKS < PULSE_TICKS,
                "Dead-time margins must leave a positive inner pulse");
 _Static_assert(N_VALUES > 0 && N_VALUES <= 128, "Payload is a 7-bit sweep");
+_Static_assert(N_VALUES + 1 <= PHASE_A_DMA_SYMBOLS / 2,
+               "A frame and EOF must fit in one DMA descriptor");
 _Static_assert(N_VALUES + 2 <= PHASE_B_MEM_SYMBOLS,
                "OUT- frame plus EOF must fit completely in hardware RAM");
 _Static_assert(BASE_TICKS + ((N_VALUES - 1) >> 1) <= 32767,
                "RMT durations must fit the 15-bit field");
+_Static_assert(INTER_BURST_US > 0, "Inter-burst timer delay must be positive");
 
 static rmt_symbol_word_t s_frame_a[N_VALUES];
 static rmt_symbol_word_t s_frame_b[N_VALUES + 1];
+
+typedef struct {
+    gptimer_handle_t gap_timer;
+    TaskHandle_t task;
+    volatile unsigned completed_channels;
+} burst_state_t;
+
+static burst_state_t s_burst;
+static portMUX_TYPE s_completion_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_idle_entries;
+
+/* Returning true lets ESP-IDF execute WAITI after this hook. Never poll here. */
+static bool idle_sleep_hook(void)
+{
+    ++s_idle_entries;
+    return true;
+}
+
+static bool IRAM_ATTR gap_elapsed(gptimer_handle_t timer,
+                                  const gptimer_alarm_event_data_t *event, void *context)
+{
+    burst_state_t *state = context;
+    BaseType_t task_woken = pdFALSE;
+    vTaskNotifyGiveFromISR(state->task, &task_woken);
+    return task_woken == pdTRUE;
+}
+
+/* The task sleeps through completion; the second IRQ starts the gap. Protect
+ * the shared count even if the RMT and GDMA interrupt priorities differ. */
+static bool IRAM_ATTR ppm_finished(rmt_channel_handle_t channel,
+                                   const rmt_tx_done_event_data_t *event, void *context)
+{
+    burst_state_t *state = context;
+    portENTER_CRITICAL_ISR(&s_completion_lock);
+    bool both_done = ++state->completed_channels == 2;
+    portEXIT_CRITICAL_ISR(&s_completion_lock);
+    if (both_done) {
+        ESP_ERROR_CHECK(gptimer_start(state->gap_timer));
+    }
+    return false;
+}
+
+static void gap_timer_init(void)
+{
+    s_burst.task = xTaskGetCurrentTaskHandle();
+    gptimer_config_t config = {
+        .clk_src = GPTIMER_CLK_SRC_XTAL,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000,
+        .intr_priority = 1,
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&config, &s_burst.gap_timer));
+    gptimer_event_callbacks_t callbacks = {.on_alarm = gap_elapsed};
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(s_burst.gap_timer, &callbacks, &s_burst));
+    ESP_ERROR_CHECK(gptimer_enable(s_burst.gap_timer));
+}
 
 /*
  * Back-port ppm_tx's nested, same-polarity waveform. A's width and rising-edge
@@ -155,6 +224,12 @@ static void pwm_init(void)
 
 void app_main(void)
 {
+    uint32_t apb_hz;
+    ESP_ERROR_CHECK(esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_APB,
+                    ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &apb_hz));
+    ESP_ERROR_CHECK(apb_hz == RMT_RES_HZ ? ESP_OK : ESP_ERR_INVALID_STATE);
+    ESP_ERROR_CHECK(esp_register_freertos_idle_hook(idle_sleep_hook));
+    gap_timer_init();
     pwm_init();
 
     render_frames();
@@ -162,11 +237,12 @@ void app_main(void)
     /* 2. RMT TX channel on OUT+, DMA-capable, 80 MHz (12.5 ns ticks). */
     rmt_channel_handle_t channels[2] = {NULL, NULL};
     rmt_tx_channel_config_t chan_cfg = {
-        .clk_src           = RMT_CLK_SRC_DEFAULT,   /* APB, 80 MHz */
+        .clk_src           = RMT_CLK_SRC_APB,       /* fixed APB, 80 MHz */
         .gpio_num          = OUT_A_GPIO,
         .resolution_hz     = RMT_RES_HZ,
-        .mem_block_symbols = 256,                   /* DMA buffer (must be even) */
+        .mem_block_symbols = PHASE_A_DMA_SYMBOLS,    /* one descriptor per frame */
         .trans_queue_depth = 4,
+        .intr_priority     = 1,
         .flags.with_dma    = true,                  /* burst straight from RAM */
     };
     ESP_ERROR_CHECK(rmt_new_tx_channel(&chan_cfg, &channels[0]));
@@ -177,6 +253,10 @@ void app_main(void)
     chan_cfg.mem_block_symbols = PHASE_B_MEM_SYMBOLS;
     chan_cfg.flags.with_dma = false;
     ESP_ERROR_CHECK(rmt_new_tx_channel(&chan_cfg, &channels[1]));
+
+    rmt_tx_event_callbacks_t tx_callbacks = {.on_trans_done = ppm_finished};
+    ESP_ERROR_CHECK(rmt_tx_register_event_callbacks(channels[0], &tx_callbacks, &s_burst));
+    ESP_ERROR_CHECK(rmt_tx_register_event_callbacks(channels[1], &tx_callbacks, &s_burst));
 
     /* 3. Copy encoder: streams our pre-built symbol array verbatim. */
     rmt_encoder_handle_t encoders[2] = {NULL, NULL};
@@ -210,20 +290,44 @@ void app_main(void)
         .loop_count = 0,            /* single shot, no hardware looping */
         .flags.eot_level = 0,       /* both outputs idle LOW after the burst */
     };
+    const gptimer_alarm_config_t gap_alarm = {
+        .alarm_count = INTER_BURST_US,
+        .flags.auto_reload_on_alarm = false,
+    };
+
+    ESP_LOGI(TAG, "Power: fixed CPU/APB 80 MHz, one core, radio drivers excluded; "
+                  "CPU WAITI between interrupts (not chip light-sleep)");
 
     uint32_t bursts = 0;
+    int64_t last_status = esp_timer_get_time();
+    configRUN_TIME_COUNTER_TYPE last_idle = ulTaskGetIdleRunTimeCounter();
+    uint32_t last_idle_entries = s_idle_entries;
     while (1) {
+        s_burst.completed_channels = 0;
+        ESP_ERROR_CHECK(gptimer_set_raw_count(s_burst.gap_timer, 0));
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(s_burst.gap_timer, &gap_alarm));
         ESP_ERROR_CHECK(rmt_sync_reset(sync));
         ESP_ERROR_CHECK(rmt_transmit(channels[0], encoders[0], s_frame_a, sizeof(s_frame_a), &tx_cfg));
         ESP_ERROR_CHECK(rmt_transmit(channels[1], encoders[1], s_frame_b, sizeof(s_frame_b), &tx_cfg));
+        /* No CPU work until both channels finish AND the 100 us alarm fires.
+         * RMT/GDMA completion IRQs only arm GPTimer; its IRQ wakes this task. */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ESP_ERROR_CHECK(gptimer_stop(s_burst.gap_timer));
+        /* Drain the already-completed driver transactions before requeueing. */
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(channels[0], -1));
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(channels[1], -1));
-        if (++bursts % 1000 == 0) {
-            ESP_LOGI(TAG, "%u bursts sent", (unsigned)bursts);
+        ++bursts;
+        int64_t now = esp_timer_get_time();
+        if (now - last_status >= STATUS_INTERVAL_US) {
+            configRUN_TIME_COUNTER_TYPE idle = ulTaskGetIdleRunTimeCounter();
+            uint32_t idle_entries = s_idle_entries;
+            configRUN_TIME_COUNTER_TYPE idle_delta = idle - last_idle;
+            ESP_LOGI(TAG, "%u bursts | idle task %.1f%% | %u WAITI entries since last report",
+                     (unsigned)bursts, 100.0 * idle_delta / (now - last_status),
+                     (unsigned)(idle_entries - last_idle_entries));
+            last_status = now;
+            last_idle = idle;
+            last_idle_entries = idle_entries;
         }
-        /* sub-tick gap, so busy-wait instead of vTaskDelay(). The
-         * wait_all_done() above blocks on a semaphore each loop, so the idle
-         * task still runs and the task watchdog stays fed. */
-        esp_rom_delay_us(INTER_BURST_US);
     }
 }
