@@ -1,14 +1,14 @@
 # XIAO ESP32-S3 PPM transmitter
 
 Port of `../ppm_tx` for the **Seeed Studio XIAO ESP32-S3**, with an independent
-continuous PWM output. Two synchronized RMT channels generate PPM phases
+configurable PWM output. Two synchronized RMT channels generate PPM phases
 with a both-LOW dead-time gap at each handoff.
 
 ## Outputs
 
 | Signal | XIAO pin | ESP32-S3 GPIO | Behavior |
 |--------|----------|---------------|----------|
-| PWM | D0 | GPIO1 | 100 kHz, 50% duty (5 us high / 5 us low), LEDC |
+| PWM | D0 | GPIO1 | 100% duty: constant HIGH (nominal 3.3 V) |
 | PPM OUT+ | D4 | GPIO5 | RMT TX, idle low |
 | PPM OUT- | D3 | GPIO4 | Complementary phase with dead time, idle low |
 
@@ -32,8 +32,10 @@ GPIO5/6 would instead be D4/D5.
   its 129-symbol frame plus EOF. No mid-frame refill interrupt is needed.
 * The RMT sync manager starts both channels together and is reset after each
   completed burst. Both outputs remain LOW during the 100 us inter-burst gap.
-* PWM runs independently and continues between bursts; its phase is not
-  synchronized to PPM.
+* D0 runs independently of PPM. `PWM_DUTY_PERCENT = 100` holds it HIGH;
+  `0` holds it LOW. For `1..99`, LEDC generates continuous PWM at
+  `PWM_FREQ_HZ` (currently 100 kHz), including between PPM bursts.
+  PWM phase is not synchronized to PPM.
 
 For each payload value, the sequence is:
 
@@ -92,9 +94,13 @@ and `idf.py -p <port> flash monitor` from this directory.
 
 ## Tuning
 
-`main/main.c` defines `PWM_GPIO`, `PWM_FREQ_HZ`, `OUT_A_GPIO`, `OUT_B_GPIO`,
+`main/main.c` defines `PWM_GPIO`, `PWM_FREQ_HZ`, `PWM_DUTY_PERCENT`, `OUT_A_GPIO`, `OUT_B_GPIO`,
 `PULSE_TICKS`, `DEAD_TIME_PERCENT`, `BASE_TICKS`, `N_VALUES`, and `INTER_BURST_US`.
 Dead time is computed from `PULSE_TICKS`; changing the pulse-width parameter
 automatically changes the gap. The frame size is limited to 128 values so
 the complete OUT- waveform fits in hardware RAM.
-The one-bit LEDC timer and duty of 1 give a fixed 50% PWM duty cycle.
+PWM frequency and duty are separate parameters. For example, set
+`PWM_FREQ_HZ = 100000` and `PWM_DUTY_PERCENT = 50` for 100 kHz at 50% duty.
+At 0% or 100%, GPIO drives a constant level and frequency is unused.
+Intermediate duties are rounded to the timer's available resolution, chosen
+automatically from the board's 40 MHz crystal and requested frequency.

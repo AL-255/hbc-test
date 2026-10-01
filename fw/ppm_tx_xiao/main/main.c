@@ -14,7 +14,7 @@
  *                 -> interval 450 ns .. 1237.5 ns with the default dead time
  *
  * Both PPM outputs are LOW during dead time and between bursts:
- *   PWM   D0 / GPIO1: 100 kHz, 50% duty, independent LEDC output
+ *   PWM   D0 / GPIO1: configurable frequency/duty; 100% holds HIGH
  *   OUT+  D4 / GPIO5
  *   OUT-  D3 / GPIO4
  */
@@ -33,7 +33,8 @@ static const char *TAG = "ppm_tx_xiao";
 
 /* ---- User configuration ------------------------------------------------ */
 #define PWM_GPIO      1            /* D0: independent PWM output             */
-#define PWM_FREQ_HZ   100000       /* 100 kHz, 50% duty                      */
+#define PWM_FREQ_HZ   100000       /* frequency used when duty is 1..99%      */
+#define PWM_DUTY_PERCENT 100       /* 0 = LOW, 100 = HIGH, otherwise PWM      */
 #define OUT_A_GPIO    5            /* D4: OUT+ (RMT TX pad)                   */
 #define OUT_B_GPIO    4            /* D3: OUT- (separate synchronized phase)  */
 
@@ -48,6 +49,9 @@ static const char *TAG = "ppm_tx_xiao";
 #define INTER_BURST_US 100         /* gap between repeated demo bursts (us)   */
 /* ------------------------------------------------------------------------ */
 
+_Static_assert(PWM_FREQ_HZ > 0, "PWM frequency must be positive");
+_Static_assert(PWM_DUTY_PERCENT >= 0 && PWM_DUTY_PERCENT <= 100,
+               "PWM duty must be between 0 and 100 percent");
 _Static_assert(PULSE_TICKS > 0 && PULSE_TICKS < BASE_TICKS,
                "Both phase widths must be positive");
 _Static_assert(DEAD_TICKS > 0, "Dead time must be at least one RMT tick");
@@ -86,13 +90,39 @@ static void render_frames(void)
     };
 }
 
-/* Continuous PWM runs in hardware, independently of the RMT DMA bursts.
- * A one-bit counter with duty=1 gives exactly 50% duty. */
+/* D0 runs independently of PPM. Use GPIO for exact 0%/100% duty, avoiding
+ * LEDC counter overflow at full duty. Intermediate duties use hardware PWM. */
 static void pwm_init(void)
 {
+    if (PWM_DUTY_PERCENT == 0 || PWM_DUTY_PERCENT == 100) {
+        const int level = PWM_DUTY_PERCENT == 100;
+        ESP_ERROR_CHECK(gpio_set_level(PWM_GPIO, level));
+        gpio_config_t gpio_cfg = {
+            .pin_bit_mask = 1ULL << PWM_GPIO,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&gpio_cfg));
+        ESP_ERROR_CHECK(gpio_set_drive_capability(PWM_GPIO, GPIO_DRIVE_CAP_3));
+        ESP_LOGI(TAG, "D0/GPIO%d ready: constant %s (%d%% duty)",
+                 PWM_GPIO, level ? "HIGH" : "LOW", PWM_DUTY_PERCENT);
+        return;
+    }
+
+    /* XIAO's XTAL is 40 MHz; choose the best resolution for the frequency. */
+    uint32_t duty_bits = ledc_find_suitable_duty_resolution(40000000, PWM_FREQ_HZ);
+    ESP_ERROR_CHECK(duty_bits ? ESP_OK : ESP_ERR_INVALID_ARG);
+    uint32_t period = 1U << duty_bits;
+    uint32_t duty = (period * PWM_DUTY_PERCENT + 50) / 100;
+    /* Keep intermediate percentages switching even at coarse resolution. */
+    if (duty == 0) duty = 1;
+    if (duty >= period) duty = period - 1;
+
     ledc_timer_config_t timer_cfg = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_1_BIT,
+        .duty_resolution = (ledc_timer_bit_t)duty_bits,
         .timer_num       = LEDC_TIMER_0,
         .freq_hz         = PWM_FREQ_HZ,
         .clk_cfg         = LEDC_USE_XTAL_CLK,
@@ -104,13 +134,13 @@ static void pwm_init(void)
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel    = LEDC_CHANNEL_0,
         .timer_sel  = LEDC_TIMER_0,
-        .duty       = 1,
+        .duty       = duty,
         .hpoint     = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&channel_cfg));
     ESP_ERROR_CHECK(gpio_set_drive_capability(PWM_GPIO, GPIO_DRIVE_CAP_3));
-    ESP_LOGI(TAG, "PWM ready: D0/GPIO%d | %u Hz, 50%% duty",
-             PWM_GPIO, (unsigned)PWM_FREQ_HZ);
+    ESP_LOGI(TAG, "PWM ready: D0/GPIO%d | %u Hz, %.2f%% duty (%d%% requested)",
+             PWM_GPIO, (unsigned)PWM_FREQ_HZ, 100.0 * duty / period, PWM_DUTY_PERCENT);
 }
 
 void app_main(void)
