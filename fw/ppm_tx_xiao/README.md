@@ -1,7 +1,8 @@
 # XIAO ESP32-S3 PPM transmitter
 
 Port of `../ppm_tx` for the **Seeed Studio XIAO ESP32-S3**, with an independent
-continuous PWM output. PPM keeps the original pre-rendered RMT DMA waveform.
+continuous PWM output. Two synchronized RMT channels generate PPM phases
+with a both-LOW dead-time gap at each handoff.
 
 ## Outputs
 
@@ -9,20 +10,39 @@ continuous PWM output. PPM keeps the original pre-rendered RMT DMA waveform.
 |--------|----------|---------------|----------|
 | PWM | D0 | GPIO1 | 100 kHz, 50% duty (5 us high / 5 us low), LEDC |
 | PPM OUT+ | D4 | GPIO5 | RMT TX, idle low |
-| PPM OUT- | D3 | GPIO4 | Inverted mirror of the same RMT signal, idle high |
+| PPM OUT- | D3 | GPIO4 | Complementary phase with dead time, idle low |
 
 The board labels determine the pin mapping: D3/D4 are GPIO4/5, as listed in
 the [Seeed pinout](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/).
 GPIO5/6 would instead be D4/D5.
 
-* PPM pulse width: **200 ns** (16 ticks at 80 MHz).
-* Rising-edge interval: `400 ns + (value >> 1) * 12.5 ns`, from **400 ns to
-  1187.5 ns** for values 0..127.
-* Each burst contains the 128-value sweep, sent as one DMA transfer, followed
-  by a 100 us gap.
-* OUT- uses the GPIO matrix to invert OUT+'s internal signal, so both legs
-  share one RMT channel. PWM runs independently and continues between bursts;
-  its phase is not synchronized to PPM.
+* OUT+ pulse width: **200 ns** (`PULSE_TICKS = 16` at 80 MHz), unchanged.
+* OUT- HIGH width: **200–987.5 ns**, preserving the original complementary
+  phase widths for the 128-value sweep.
+* Dead time at **each** handoff: **10% of the configured OUT+ pulse width**,
+  rounded up to the next 12.5 ns RMT tick. At 200 ns, the requested 20 ns
+  becomes **25 ns** (`DEAD_TICKS = 2`). Both outputs are LOW during this gap.
+* OUT+ rising-edge interval:
+  `400 ns + (value >> 1) * 12.5 ns + 2 * dead_time`, from **450 ns to
+  1237.5 ns** with the defaults. Adding gaps without shortening either phase
+  extends the original interval by 50 ns; it no longer fits the old
+  400–1200 ns window.
+* The 128-value sweep is pre-rendered. OUT+ uses the S3's single DMA TX
+  channel; OUT- uses three hardware memory blocks (144 symbols), enough for
+  its 129-symbol frame plus EOF. No mid-frame refill interrupt is needed.
+* The RMT sync manager starts both channels together and is reset after each
+  completed burst. Both outputs remain LOW during the 100 us inter-burst gap.
+* PWM runs independently and continues between bursts; its phase is not
+  synchronized to PPM.
+
+For each payload value, the sequence is:
+
+```text
+OUT+ HIGH for PULSE_TICKS
+both LOW for DEAD_TICKS
+OUT- HIGH for BASE_TICKS + (value >> 1) - PULSE_TICKS
+both LOW for DEAD_TICKS
+```
 
 Use a scope to check D0's frequency/duty and the complementary PPM waveform
 after flashing. Compilation alone does not verify physical output timing.
@@ -60,5 +80,8 @@ and `idf.py -p <port> flash monitor` from this directory.
 ## Tuning
 
 `main/main.c` defines `PWM_GPIO`, `PWM_FREQ_HZ`, `OUT_A_GPIO`, `OUT_B_GPIO`,
-`PULSE_TICKS`, `BASE_TICKS`, `N_VALUES`, and `INTER_BURST_US`.
+`PULSE_TICKS`, `DEAD_TIME_PERCENT`, `BASE_TICKS`, `N_VALUES`, and `INTER_BURST_US`.
+Dead time is computed from `PULSE_TICKS`; changing the pulse-width parameter
+automatically changes the gap. The frame size is limited to 128 values so
+the complete OUT- waveform fits in hardware RAM.
 The one-bit LEDC timer and duty of 1 give a fixed 50% PWM duty cycle.

@@ -2,36 +2,31 @@
  * PPM (Pulse-Position Modulation) transmitter
  * Board : Seeed Studio XIAO ESP32-S3
  *
- * Constant 200 ns pulse, variable interval. The whole frame is pre-rendered
- * into a buffer and fired as ONE DMA burst via the RMT peripheral -- the
- * peripheral walks the buffer itself, zero CPU per pulse. (A per-pulse timer
- * ISR can't keep up: the shortest interval here is 400 ns, well under the
- * interrupt service time, so DMA is the only way to stream this cleanly.)
+ * Two synchronized RMT channels generate non-overlapping phases. The complete
+ * frame is pre-rendered: OUT+ streams by DMA; OUT- fits in hardware RMT RAM.
+ * Neither channel needs CPU service to generate individual pulses.
  *
  * Timing (RMT runs at 80 MHz, the S3 maximum -> 12.5 ns / tick):
  *   Pulse width : 200 ns  = 16 ticks  (constant)
- *   Interval    : 400 ns + position * 12.5 ns
+ *   Dead time   : ceil(pulse width * 10%) on the 12.5 ns grid = 25 ns
+ *   Interval    : 400 ns + position * 12.5 ns + 2 * dead time
  *   Payload     : value 0..127, position = value >> 1  (2:1 -> 64 positions)
- *                 -> interval 400 ns .. 1187.5 ns, inside the 400..1200 ns window
+ *                 -> interval 450 ns .. 1237.5 ns with the default dead time
  *
- * Outputs (complementary / differential, zero skew -- both derive from the
- * same RMT signal; OUT- is the same signal inverted at the pad):
+ * Both PPM outputs are LOW during dead time and between bursts:
  *   PWM   D0 / GPIO1: 100 kHz, 50% duty, independent LEDC output
  *   OUT+  D4 / GPIO5
  *   OUT-  D3 / GPIO4
  */
 
 #include <stdint.h>
-#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/rmt_tx.h"
 #include "driver/rmt_encoder.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
-#include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
-#include "soc/gpio_struct.h"
 #include "esp_log.h"
 
 static const char *TAG = "ppm_tx_xiao";
@@ -40,34 +35,55 @@ static const char *TAG = "ppm_tx_xiao";
 #define PWM_GPIO      1            /* D0: independent PWM output             */
 #define PWM_FREQ_HZ   100000       /* 100 kHz, 50% duty                      */
 #define OUT_A_GPIO    5            /* D4: OUT+ (RMT TX pad)                   */
-#define OUT_B_GPIO    4            /* D3: OUT- (inverted mirror of OUT+)      */
+#define OUT_B_GPIO    4            /* D3: OUT- (separate synchronized phase)  */
 
 #define RMT_RES_HZ    80000000     /* 80 MHz -> 12.5 ns / tick (RMT max on S3)*/
 #define PULSE_TICKS   16           /* 200 ns constant high time (16 x 12.5 ns)*/
 #define BASE_TICKS    32           /* 400 ns minimum interval (position 0)    */
+#define DEAD_TIME_PERCENT 10       /* percentage of PULSE_TICKS, rounded UP   */
+#define DEAD_TICKS ((PULSE_TICKS * DEAD_TIME_PERCENT + 99) / 100)
+#define PHASE_B_MEM_SYMBOLS 144     /* three 48-symbol blocks; DMA uses fourth */
 
 #define N_VALUES      128          /* payload sweep 0..127                    */
 #define INTER_BURST_US 100         /* gap between repeated demo bursts (us)   */
 /* ------------------------------------------------------------------------ */
 
-static uint8_t          s_payload[N_VALUES];   /* the data buffer: 0..127 sweep   */
-static rmt_symbol_word_t s_frame[N_VALUES];    /* one RMT symbol per PPM pulse     */
+_Static_assert(PULSE_TICKS > 0 && PULSE_TICKS < BASE_TICKS,
+               "Both phase widths must be positive");
+_Static_assert(DEAD_TICKS > 0, "Dead time must be at least one RMT tick");
+_Static_assert(N_VALUES > 0 && N_VALUES <= 128, "Payload is a 7-bit sweep");
+_Static_assert(N_VALUES + 2 <= PHASE_B_MEM_SYMBOLS,
+               "OUT- frame plus EOF must fit completely in hardware RAM");
+_Static_assert(BASE_TICKS + ((N_VALUES - 1) >> 1) + 2 * DEAD_TICKS <= 32767,
+               "RMT durations must fit the 15-bit field");
+
+static rmt_symbol_word_t s_frame_a[N_VALUES];
+static rmt_symbol_word_t s_frame_b[N_VALUES + 1];
 
 /*
- * Render one payload value into a PPM RMT symbol:
- *   level0 = HIGH for PULSE_TICKS           (constant 200 ns pulse)
- *   level1 = LOW  for the rest of the interval
- * interval = BASE_TICKS + (value >> 1) ticks ; gap = interval - pulse.
+ * Preserve both original HIGH widths, inserting a both-LOW gap between them:
+ *   OUT+ HIGH P, both LOW D, OUT- HIGH L, both LOW D.
+ *   P = PULSE_TICKS; L = BASE_TICKS + (value >> 1) - P; D = DEAD_TICKS.
+ * The OUT- LOW run spans the previous trailing gap, OUT+'s pulse, and the
+ * next gap. The first run has no previous trailing gap; the last is explicit.
  */
-static inline rmt_symbol_word_t ppm_symbol(uint8_t value)
+static void render_frames(void)
 {
-    uint32_t interval_ticks = BASE_TICKS + (value >> 1);     /* 32 .. 95  */
-    uint32_t low_ticks      = interval_ticks - PULSE_TICKS;  /* 16 .. 79  */
-    rmt_symbol_word_t sym = {
-        .level0 = 1, .duration0 = PULSE_TICKS,   /* 200 ns high */
-        .level1 = 0, .duration1 = low_ticks,     /* gap         */
+    for (int i = 0; i < N_VALUES; i++) {
+        uint32_t phase_b_ticks = BASE_TICKS + (i >> 1) - PULSE_TICKS;
+        s_frame_a[i] = (rmt_symbol_word_t) {
+            .level0 = 1, .duration0 = PULSE_TICKS,
+            .level1 = 0, .duration1 = phase_b_ticks + 2 * DEAD_TICKS,
+        };
+        s_frame_b[i] = (rmt_symbol_word_t) {
+            .level0 = 0, .duration0 = PULSE_TICKS + (i == 0 ? DEAD_TICKS : 2 * DEAD_TICKS),
+            .level1 = 1, .duration1 = phase_b_ticks,
+        };
+    }
+    s_frame_b[N_VALUES] = (rmt_symbol_word_t) {
+        .level0 = 0, .duration0 = DEAD_TICKS,
+        .level1 = 0, .duration1 = 0, /* stop after the final both-LOW gap */
     };
-    return sym;
 }
 
 /* Continuous PWM runs in hardware, independently of the RMT DMA bursts.
@@ -101,15 +117,10 @@ void app_main(void)
 {
     pwm_init();
 
-    /* 1. Fill the payload buffer with the 0..127 sweep, then pre-render the
-     *    entire frame into RMT symbols. */
-    for (int i = 0; i < N_VALUES; i++) {
-        s_payload[i] = (uint8_t)i;
-        s_frame[i]   = ppm_symbol(s_payload[i]);
-    }
+    render_frames();
 
     /* 2. RMT TX channel on OUT+, DMA-capable, 80 MHz (12.5 ns ticks). */
-    rmt_channel_handle_t chan = NULL;
+    rmt_channel_handle_t channels[2] = {NULL, NULL};
     rmt_tx_channel_config_t chan_cfg = {
         .clk_src           = RMT_CLK_SRC_DEFAULT,   /* APB, 80 MHz */
         .gpio_num          = OUT_A_GPIO,
@@ -118,40 +129,54 @@ void app_main(void)
         .trans_queue_depth = 4,
         .flags.with_dma    = true,                  /* burst straight from RAM */
     };
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&chan_cfg, &chan));
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&chan_cfg, &channels[0]));
+
+    /* ESP32-S3 has only one DMA TX channel. Reserve the other three memory
+     * blocks for OUT- so all 129 symbols and EOF are preloaded before start. */
+    chan_cfg.gpio_num = OUT_B_GPIO;
+    chan_cfg.mem_block_symbols = PHASE_B_MEM_SYMBOLS;
+    chan_cfg.flags.with_dma = false;
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&chan_cfg, &channels[1]));
 
     /* 3. Copy encoder: streams our pre-built symbol array verbatim. */
-    rmt_encoder_handle_t encoder = NULL;
+    rmt_encoder_handle_t encoders[2] = {NULL, NULL};
     rmt_copy_encoder_config_t copy_cfg = {};
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_cfg, &encoder));
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_cfg, &encoders[0]));
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_cfg, &encoders[1]));
 
-    /* 4. Complementary leg: mirror the RMT output signal onto OUT-, inverted,
-     *    through the GPIO matrix. Both pads come from the same internal signal,
-     *    so OUT- is a true zero-skew inverse of OUT+. */
-    uint32_t rmt_sig = GPIO.func_out_sel_cfg[OUT_A_GPIO].func_sel;
-    esp_rom_gpio_pad_select_gpio(OUT_B_GPIO);
-    ESP_ERROR_CHECK(gpio_set_direction(OUT_B_GPIO, GPIO_MODE_OUTPUT));
-    esp_rom_gpio_connect_out_signal(OUT_B_GPIO, rmt_sig, true /*invert*/, false);
+    /* 4. Start both phases on the same hardware trigger. A pad inverter
+     * cannot create dead time because it has no independent edge timing. */
     ESP_ERROR_CHECK(gpio_set_drive_capability(OUT_A_GPIO, GPIO_DRIVE_CAP_3));
     ESP_ERROR_CHECK(gpio_set_drive_capability(OUT_B_GPIO, GPIO_DRIVE_CAP_3));
 
-    ESP_ERROR_CHECK(rmt_enable(chan));
+    ESP_ERROR_CHECK(rmt_enable(channels[0]));
+    ESP_ERROR_CHECK(rmt_enable(channels[1]));
+    rmt_sync_manager_handle_t sync = NULL;
+    rmt_sync_manager_config_t sync_cfg = {
+        .tx_channel_array = channels,
+        .array_size = 2,
+    };
+    ESP_ERROR_CHECK(rmt_new_sync_manager(&sync_cfg, &sync));
 
-    ESP_LOGI(TAG, "PPM TX ready: OUT+=GPIO%d OUT-=GPIO%d | 200 ns pulse, "
-                  "12.5 ns grid | %d-value sweep (%u symbols) per DMA burst",
-             OUT_A_GPIO, OUT_B_GPIO, N_VALUES, (unsigned)N_VALUES);
+    ESP_LOGI(TAG, "PPM TX ready: OUT+=GPIO%d OUT-=GPIO%d | pulse %.1f ns | "
+                  "dead time %d%% requested, %.1f ns actual at each handoff | %d-value sweep",
+             OUT_A_GPIO, OUT_B_GPIO, PULSE_TICKS * 1e9 / RMT_RES_HZ,
+             DEAD_TIME_PERCENT, DEAD_TICKS * 1e9 / RMT_RES_HZ, N_VALUES);
 
     /* 5. Fire the sweep as one finite DMA burst; repeat with a gap so a scope
      *    or logic analyzer can retrigger on it. */
     rmt_transmit_config_t tx_cfg = {
         .loop_count = 0,            /* single shot, no hardware looping */
-        .flags.eot_level = 0,       /* idle LOW on OUT+ after the burst  */
+        .flags.eot_level = 0,       /* both outputs idle LOW after the burst */
     };
 
     uint32_t bursts = 0;
     while (1) {
-        ESP_ERROR_CHECK(rmt_transmit(chan, encoder, s_frame, sizeof(s_frame), &tx_cfg));
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(chan, portMAX_DELAY));
+        ESP_ERROR_CHECK(rmt_transmit(channels[0], encoders[0], s_frame_a, sizeof(s_frame_a), &tx_cfg));
+        ESP_ERROR_CHECK(rmt_transmit(channels[1], encoders[1], s_frame_b, sizeof(s_frame_b), &tx_cfg));
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(channels[0], -1));
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(channels[1], -1));
+        ESP_ERROR_CHECK(rmt_sync_reset(sync));
         if (++bursts % 1000 == 0) {
             ESP_LOGI(TAG, "%u bursts sent", (unsigned)bursts);
         }
